@@ -115,15 +115,15 @@ The script automatically detects the package manager (`apt`, `dnf`, or `pacman`)
 ### Debian / Devuan
 ```bash
 sudo apt update
-sudo apt install -y coreutils util-linux grep procps systemd
+sudo apt install -y coreutils util-linux grep procps systemd bpftool jq
 ```
 ### Fedora
 ```bash
-sudo dnf install -y coreutils util-linux grep procps-ng systemd
+sudo dnf install -y coreutils util-linux grep procps-ng systemd bpftool  jq
 ```
 ### Arch Linux
 ```bash
-sudo pacman -Syu coreutils util-linux grep procps-ng systemd
+sudo pacman -S coreutils util-linux grep procps-ng systemd bpf jq
 ```
 Minimal containers may also need `bash`, `awk`, or `curl`.
 
@@ -132,19 +132,11 @@ Minimal containers may also need `bash`, `awk`, or `curl`.
 ## Optional Tools
 ### Install Grype (CVE Scanner)
 ```bash
-curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+ sudo grype db update    # update the CVE database
+ curl -sSfL https://get.anchore.io/grype | sudo sh -s -- -b /usr/local/bin
+ curl -sSfL https://get.anchore.io/syft | sudo sh -s -- -b /usr/local/bin
 ```
-If a packaged version exists:
-```bash
-# Debian / Devuan
-sudo apt install -y grype
-# Fedora COPR
-sudo dnf install -y grype
-```
-### Install Syft (SBOM Generator, Optional)
-```bash
-curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-```
+
 ### Install Lynis (Complementary Audit)
 ```bash
 sudo apt install -y lynis     # Debian / Devuan
