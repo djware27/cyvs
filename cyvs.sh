@@ -30,18 +30,55 @@
 #!/bin/bash
 
 # -------- Minimal cross-distro helpers (added) --------
+# -------- Cross-distro detection (updated) --------
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-PKG_MGR=unknown
-if have_cmd apt-get || have_cmd apt; then
-  PKG_MGR=apt
-elif have_cmd dnf || have_cmd yum; then
-  PKG_MGR=dnf
-elif have_cmd pacman; then
-  PKG_MGR=pacman
-elif have_cmd apk; then
-  PKG_MGR=apk
+OS_ID=unknown
+if [ -r /etc/os-release ]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  OS_ID="${ID:-unknown}"
 fi
+
+PKG_MGR=unknown
+PKG_DB=unknown  # dpkg|rpm|pacman|apk (useful for inventory paths)
+
+case "$OS_ID" in
+  debian|ubuntu|devuan)
+    PKG_MGR=apt;     PKG_DB=dpkg
+    ;;
+  fedora|rhel|centos|rocky|almalinux)
+    PKG_MGR=dnf;     PKG_DB=rpm
+    ;;
+  opensuse*|suse|tumbleweed|sle)
+    PKG_MGR=zypper;  PKG_DB=rpm
+    ;;
+  arch|manjaro|endeavouros)
+    PKG_MGR=pacman;  PKG_DB=pacman
+    ;;
+  alpine)
+    PKG_MGR=apk;     PKG_DB=apk
+    ;;
+  *)
+    # Fallback by probing commands (containers/minimal OS without os-release)
+    if have_cmd apt-get || have_cmd apt; then PKG_MGR=apt; PKG_DB=dpkg
+    elif have_cmd dnf || have_cmd yum;   then PKG_MGR=dnf; PKG_DB=rpm
+    elif have_cmd zypper;                then PKG_MGR=zypper; PKG_DB=rpm
+    elif have_cmd pacman;                then PKG_MGR=pacman; PKG_DB=pacman
+    elif have_cmd apk;                   then PKG_MGR=apk; PKG_DB=apk
+    fi
+    ;;
+esac
+
+list_installed_packages() {
+  case "$PKG_DB" in
+    dpkg)   dpkg-query -W -f='${Package}\t${Version}\n' 2>/dev/null | sort ;;
+    rpm)    rpm -qa --qf '%{NAME}\t%{VERSION}-%{RELEASE}\n' 2>/dev/null | sort ;;
+    pacman) pacman -Q 2>/dev/null | awk '{print $1 "\t" $2}' | sort ;;
+    apk)    apk info -vv 2>/dev/null | awk -F- 'NF{pkg=$0; sub(/-[^-]+-[^-]+$/, "", pkg); ver=$0; sub(/.*-([^-]+-[^-]+)$/, "\\1", ver); print pkg "\t" ver}' | sort ;;
+    *)      echo "# package inventory unavailable on this distro" ;;
+  esac
+}
 
 install_hint() {
   case "$PKG_MGR" in
