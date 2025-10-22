@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # cyvs.sh — Cybergizmo Verification Script (Cross-Distro)
 # Purpose: Verify kernel mitigations, cgroup hierarchy, bootline safety, service health,
 #          and package vulnerability exposure (via Grype/Syft).
@@ -26,8 +26,6 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
-
-#!/bin/bash
 
 # -------- Minimal cross-distro helpers (added) --------
 # -------- Cross-distro detection (updated) --------
@@ -235,10 +233,8 @@ fi
 # ----------------------------
 # Step 16: Software Inventory (Syft → SBOM)
 # ----------------------------
-echo "=== Step 16: Software Inventory (syft SBOM) ==="
 
-# Optional offline mode: export CYVS_OFFLINE=1 before running
-[ -n "${CYVS_OFFLINE:-}" ] && export SYFT_CHECK_FOR_APP_UPDATE=false GRYPE_DB_AUTO_UPDATE=false
+echo "=== Test 16: Software Inventory + SBOM ==="
 
 # Use sudo only if not already root
 if [ "$(id -u)" -ne 0 ]; then SUDO="sudo"; else SUDO=""; fi
@@ -252,17 +248,67 @@ TS="$(date +%Y%m%d_%H%M%S)"
 SBOM_JSON="${OUTDIR}/syft_sbom_${TS}.json"
 SBOM_CDX="${OUTDIR}/syft_sbom_${TS}.cyclonedx.json"
 
+# >>> Exclude feature: convert to Syft-compatible relative globs (./.../**)
+EXCLUDES_MOUNTS_FILE="${CYVS_EXCLUDES_MOUNTS_FILE:-/etc/cyvs/excludes.mounts}"
+
+# hard-reset arrays so nothing leaks in from earlier code
+unset SYFT_EX_ARGS SYFT_EX_SHOW
+declare -a SYFT_EX_ARGS SYFT_EX_SHOW
+
+if [ -r "$EXCLUDES_MOUNTS_FILE" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    # strip comments and surrounding whitespace
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -z "$line" ] && continue
+
+    # Build Syft pattern:
+    # - './something/**' = already relative glob → pass through
+    # - '/absolute/path' → './absolute/path/**'
+    # - 'name'           → './name/**'
+    if [[ "$line" == ./* ]]; then
+      pat="$line"
+    elif [[ "${line:0:1}" == "/" ]]; then
+      rel="${line#/}"; rel="${rel%/}"
+      pat="./${rel}/**"
+    else
+      name="${line%/}"
+      pat="./${name}/**"
+    fi
+
+    SYFT_EX_ARGS+=(--exclude "$pat")
+    SYFT_EX_SHOW+=("$pat")
+  done < "$EXCLUDES_MOUNTS_FILE"
+fi
+
+# Confirm what Syft will actually skip (converted patterns)
+#if ((${#SYFT_EX_ARGS[@]})); then
+#  echo "[INFO] Syft exclude rules active (${#SYFT_EX_SHOW[@]} entries):"
+#  for p in "${SYFT_EX_SHOW[@]}"; do
+#    echo "  - $p"
+#  done
+#else
+#  echo "[INFO] No Syft exclude file detected; scanning entire filesystem."
+#fi
+
+# Extra sanity: print the array exactly as passed to syft (comment out later)
+declare -p SYFT_EX_ARGS | sed 's/^/[DEBUG] /'
+# <<< end exclude feature
+
 if command -v syft >/dev/null 2>&1; then
   echo "[+] Generating SBOM (JSON)…"
-  if $SUDO syft dir:/ -o json > "$SBOM_JSON"; then
-    echo "[+] SBOM saved: $SBOM_JSON"
+#  echo "CMD: $SUDO syft dir:/ ${SYFT_EX_ARGS[*]} -o json > $SBOM_JSON"
+  if $SUDO syft dir:/ "${SYFT_EX_ARGS[@]}" -o json > "$SBOM_JSON"; then
+    echo "[+] SBOM (JSON) saved: $SBOM_JSON"
   else
     echo "[!] syft failed to generate JSON SBOM" >&2
     SBOM_JSON=""
   fi
 
   echo "[+] Generating SBOM (CycloneDX JSON)…"
-  if $SUDO syft dir:/ -o cyclonedx-json > "$SBOM_CDX"; then
+#  echo "CMD: $SUDO syft dir:/ ${SYFT_EX_ARGS[*]} -o cyclonedx-json > $SBOM_CDX"
+  if $SUDO syft dir:/ "${SYFT_EX_ARGS[@]}" -o cyclonedx-json > "$SBOM_CDX"; then
     echo "[+] CycloneDX SBOM saved: $SBOM_CDX"
   else
     echo "[!] syft failed to generate CycloneDX SBOM" >&2
@@ -274,38 +320,39 @@ else
 fi
 
 # ----------------------------
-# Step 17: Vulnerability Scan (Grype ← SBOM)
+# Step 17: Vulnerability Scan (Grype from SBOM)
 # ----------------------------
 echo "=== Step 17: Vulnerability Scan (grype from SBOM) ==="
 
-# Grype outputs
+SRC=""
+if [ -n "$SBOM_CDX" ] && [ -s "$SBOM_CDX" ]; then
+  SRC="sbom:${SBOM_CDX}"
+elif [ -n "$SBOM_JSON" ] && [ -s "$SBOM_JSON" ]; then
+  SRC="sbom:${SBOM_JSON}"
+fi
+
 GRYPE_OUT="${OUTDIR}/grype_report_${TS}.txt"
 GRYPE_JSON="${OUTDIR}/grype_report_${TS}.json"
 
 if command -v grype >/dev/null 2>&1; then
-  # Prefer JSON SBOM; then CycloneDX; else fall back to live filesystem scan
-  if [ -n "$SBOM_JSON" ] && [ -s "$SBOM_JSON" ]; then
-    SRC="sbom:${SBOM_JSON}"
-  elif [ -n "$SBOM_CDX" ] && [ -s "$SBOM_CDX" ]; then
-    SRC="sbom:${SBOM_CDX}"
-  else
-    echo "[!] SBOM not found; falling back to direct filesystem scan (slower)."
+  if [ -z "$SRC" ]; then
+    echo "[!] No SBOM produced by syft; grype will attempt to scan root filesystem."
     SRC="dir:/"
   fi
 
   echo "[+] Running grype against ${SRC} …"
-  # Human-readable table for terminal + file
   grype "$SRC" -o table | tee "$GRYPE_OUT" >/dev/null
-  # Machine-parsable JSON for clean summary
   grype "$SRC" -o json > "$GRYPE_JSON" 2>/dev/null || true
 
-  echo "[+] Grype report saved: $GRYPE_OUT"
-  [ -s "$GRYPE_JSON" ] && echo "[+] Grype JSON saved:  $GRYPE_JSON"
+  echo "[+] Grype reports saved:"
+  echo "    - Table: $GRYPE_OUT"
+  echo "    - JSON : $GRYPE_JSON"
 else
   echo "[-] grype not installed. Install with:"
   echo "    curl -sSfL https://get.anchore.io/grype | sudo sh -s -- -b /usr/local/bin"
 fi
-
+echo ""
+echo ""
 # ----------------------------
 # Step 18: CVE Summary (complete totals)
 # ----------------------------
@@ -314,56 +361,40 @@ echo "=== Step 18: CVE Summary ==="
 if [ -s "$GRYPE_JSON" ] && command -v jq >/dev/null 2>&1; then
   TOTAL=$(jq '(.matches // []) | length' "$GRYPE_JSON")
 
-  CRIT=$(jq '[.matches[].vulnerability.severity // "" | ascii_downcase] | map(select(.=="critical"))   | length' "$GRYPE_JSON")
-  HIGH=$(jq '[.matches[].vulnerability.severity // "" | ascii_downcase] | map(select(.=="high"))       | length' "$GRYPE_JSON")
-  MED=$(jq  '[.matches[].vulnerability.severity // "" | ascii_downcase] | map(select(.=="medium"))     | length' "$GRYPE_JSON")
-  LOW=$(jq  '[.matches[].vulnerability.severity // "" | ascii_downcase] | map(select(.=="low"))        | length' "$GRYPE_JSON")
-  NEGL=$(jq '[.matches[].vulnerability.severity // "" | ascii_downcase] | map(select(.=="negligible")) | length' "$GRYPE_JSON")
-  UNK=$(jq  '[.matches[].vulnerability.severity // "" | ascii_downcase] | map(select(.=="unknown"))    | length' "$GRYPE_JSON")
+  # Severity tallies
+  CRIT=$(jq '[.matches[]? | .vulnerability.severity // empty | ascii_downcase | select(.=="critical")]   | length' "$GRYPE_JSON")
+  HIGH=$(jq '[.matches[]? | .vulnerability.severity // empty | ascii_downcase | select(.=="high")]       | length' "$GRYPE_JSON")
+  MED=$( jq '[.matches[]? | .vulnerability.severity // empty | ascii_downcase | select(.=="medium")]     | length' "$GRYPE_JSON")
+  LOW=$( jq '[.matches[]? | .vulnerability.severity // empty | ascii_downcase | select(.=="low")]        | length' "$GRYPE_JSON")
+  NEGL=$(jq '[.matches[]? | .vulnerability.severity // empty | ascii_downcase | select(.=="negligible")] | length' "$GRYPE_JSON")
+  UNK=$( jq '[.matches[]? | .vulnerability.severity // empty | ascii_downcase | select(.=="unknown")]    | length' "$GRYPE_JSON")
 
-  FIXED=$(jq   '[.matches[].vulnerability.fix.state // "" | ascii_downcase] | map(select(.=="fixed"))     | length' "$GRYPE_JSON")
-  NOTFIX=$(jq  '[.matches[].vulnerability.fix.state // "" | ascii_downcase] | map(select(.=="not-fixed")) | length' "$GRYPE_JSON")
-  IGNORED=$(jq '[.matches[] | select((.ignored // false) == true)] | length' "$GRYPE_JSON")
+  # Fix-state tallies (note: path is .vulnerability.fix.state)
+  # include a few common variants just in case
+  FIXED=$(
+    jq '[.matches[]? 
+          | .vulnerability.fix.state // empty 
+          | ascii_downcase 
+          | select(.=="fixed")] 
+        | length' "$GRYPE_JSON"
+  )
+  NOTFIX=$(
+    jq '[.matches[]? 
+          | .vulnerability.fix.state // empty 
+          | ascii_downcase 
+          | select(.=="not-fixed" or .=="notfixed")] 
+        | length' "$GRYPE_JSON"
+  )
+  IGNORED=$(
+    jq '[.matches[]? 
+          | .vulnerability.fix.state // empty 
+          | ascii_downcase 
+          | select(.=="wont-fix" or .=="will-not-fix" or .=="deferred")] 
+        | length' "$GRYPE_JSON"
+  )
 
-  SUM_STATUS=$(( FIXED + NOTFIX + IGNORED ))
-  NOSTATUS=$(( TOTAL - SUM_STATUS ))
-
-  printf "  Total matches: %s\n" "$TOTAL"
-  printf "  \n"
-  printf "  By severity:\n"
-  printf "    Critical:    %s\n" "$CRIT"
-  printf "    High:        %s\n" "$HIGH"
-  printf "    Medium:      %s\n" "$MED"
-  printf "    Low:         %s\n" "$LOW"
-  printf "    Negligible:  %s\n" "$NEGL"
-  printf "    Unknown:     %s\n" "$UNK"
-  printf "  \n"
-  printf "  By status:\n"
-  printf "    Fixed:       %s\n" "$FIXED"
-  printf "    Not-fixed:   %s\n" "$NOTFIX"
-  printf "    Ignored:     %s\n" "$IGNORED"
-  if [ "$NOSTATUS" -ne 0 ]; then
-    printf "    No-status:   %s\n" "$NOSTATUS"
-  fi
-
-elif [ -s "$GRYPE_OUT" ]; then
-  # Fallback to table output if JSON missing
-  sev_line=$(grep -m1 'by severity:' "$GRYPE_OUT" || true)
-  stat_line=$(grep -m1 'by status:' "$GRYPE_OUT" || true)
-
-  CRIT=$(printf "%s\n" "$sev_line" | sed -n 's/.*by severity:[[:space:]]*\([0-9]\+\)[[:space:]]*critical.*/\1/p')
-  HIGH=$(printf "%s\n" "$sev_line" | sed -n 's/.*critical,[[:space:]]*\([0-9]\+\)[[:space:]]*high.*/\1/p')
-  MED=$(printf "%s\n"  "$sev_line" | sed -n 's/.*high,[[:space:]]*\([0-9]\+\)[[:space:]]*medium.*/\1/p')
-  LOW=$(printf "%s\n"  "$sev_line" | sed -n 's/.*medium,[[:space:]]*\([0-9]\+\)[[:space:]]*low.*/\1/p')
-  NEGL=$(printf "%s\n" "$sev_line" | sed -n 's/.*low,[[:space:]]*\([0-9]\+\)[[:space:]]*negligible.*/\1/p')
-  UNK=$(printf "%s\n"  "$sev_line" | sed -n 's/.*negligible,[[:space:]]*\([0-9]\+\)[[:space:]]*unknown.*/\1/p')
-
-  FIXED=$(printf "%s\n" "$stat_line" | sed -n 's/.*by status:[[:space:]]*\([0-9]\+\)[[:space:]]*fixed.*/\1/p')
-  NOTFIX=$(printf "%s\n" "$stat_line" | sed -n 's/.*fixed,[[:space:]]*\([0-9]\+\)[[:space:]]*not-fixed.*/\1/p')
-  IGNORED=$(printf "%s\n" "$stat_line" | sed -n 's/.*not-fixed,[[:space:]]*\([0-9]\+\)[[:space:]]*ignored.*/\1/p')
-
-  # We cannot reliably get TOTAL from the table lines alone if they wrap; suppress it here.
-  printf "  By severity (from table):\n"
+  echo "[+] CVE Totals:"
+  printf "    Total:       %s\n" "${TOTAL:-0}"
   printf "    Critical:    %s\n" "${CRIT:-0}"
   printf "    High:        %s\n" "${HIGH:-0}"
   printf "    Medium:      %s\n" "${MED:-0}"
@@ -371,10 +402,11 @@ elif [ -s "$GRYPE_OUT" ]; then
   printf "    Negligible:  %s\n" "${NEGL:-0}"
   printf "    Unknown:     %s\n" "${UNK:-0}"
   printf "  \n"
-  printf "  By status (from table):\n"
+  printf "  By status (from Grype JSON):\n"
   printf "    Fixed:       %s\n" "${FIXED:-0}"
   printf "    Not-fixed:   %s\n" "${NOTFIX:-0}"
   printf "    Ignored:     %s\n" "${IGNORED:-0}"
+
 else
   echo "[-] No Grype output to summarize."
 fi
